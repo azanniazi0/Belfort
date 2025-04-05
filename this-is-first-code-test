@@ -1,0 +1,153 @@
+# stock_model_dual_source.py
+
+import yfinance as yf
+from alpha_vantage.timeseries import TimeSeries
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+import datetime
+import os
+import streamlit as st
+
+# ---------------- CONFIG ----------------
+TICKER = "AAPL"
+INTERVAL = "60min"  # For Alpha Vantage
+YF_INTERVAL = "1h"  # For yfinance
+LOOKBACK_DAYS = 180
+FUTURE_HORIZON = 3
+RR_RATIO = 2
+ALPHA_VANTAGE_API_KEY = os.getenv("3Y2KVD1N3HL0EU6O") or "3Y2KVD1N3HL0EU6O"
+
+# ---------------- DATA LOADERS ----------------
+def get_yfinance_data(ticker, interval, lookback_days):
+    end = datetime.datetime.now()
+    start = end - datetime.timedelta(days=lookback_days)
+    df = yf.download(ticker, start=start, end=end, interval=interval)
+    df.index = df.index.tz_localize(None)
+    return df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+
+def get_alpha_vantage_data(ticker, interval):
+    ts = TimeSeries(key=ALPHA_VANTAGE_API_KEY, output_format='pandas')
+    data, _ = ts.get_intraday(symbol=ticker, interval=interval, outputsize='full')
+    data = data.rename(columns={
+        '1. open': 'Open',
+        '2. high': 'High',
+        '3. low': 'Low',
+        '4. close': 'Close',
+        '5. volume': 'Volume'
+    })
+    data.index = pd.to_datetime(data.index)
+    data = data.sort_index()
+    return data.dropna()
+
+def merge_data(df1, df2):
+    df1 = df1.copy()
+    df2 = df2.copy()
+    combined = pd.merge(df1, df2, left_index=True, right_index=True, suffixes=('_yf', '_av'))
+    averaged = pd.DataFrame({
+        'Open': combined[['Open_yf', 'Open_av']].mean(axis=1),
+        'High': combined[['High_yf', 'High_av']].mean(axis=1),
+        'Low': combined[['Low_yf', 'Low_av']].mean(axis=1),
+        'Close': combined[['Close_yf', 'Close_av']].mean(axis=1),
+        'Volume': combined[['Volume_yf', 'Volume_av']].mean(axis=1)
+    })
+    return averaged.dropna()
+
+# ---------------- FEATURES ----------------
+def compute_features(df):
+    df['Return'] = df['Close'].pct_change()
+    df['MA20'] = df['Close'].rolling(window=20).mean()
+    df['MA50'] = df['Close'].rolling(window=50).mean()
+    df['Volatility'] = df['Return'].rolling(window=20).std()
+    df['Target'] = df['Close'].shift(-FUTURE_HORIZON)
+    return df.dropna()
+
+# ---------------- TP/SL CALCULATOR ----------------
+def calculate_trade_levels(entry, prediction, rr_ratio=2):
+    if prediction > entry:
+        risk = (prediction - entry) / rr_ratio
+        sl = entry - risk
+        tp = entry + rr_ratio * risk
+    else:
+        risk = (entry - prediction) / rr_ratio
+        sl = entry + risk
+        tp = entry - rr_ratio * risk
+    return tp, sl
+
+# ---------------- MAIN ----------------
+def run_model():
+    print("Loading data from yfinance and Alpha Vantage...")
+    df_yf = get_yfinance_data(TICKER, YF_INTERVAL, LOOKBACK_DAYS)
+    df_av = get_alpha_vantage_data(TICKER, INTERVAL)
+
+    df = merge_data(df_yf, df_av)
+    df = compute_features(df)
+
+    features = ['Open', 'High', 'Low', 'Close', 'Volume', 'MA20', 'MA50', 'Volatility']
+    X = df[features]
+    y = df['Target']
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, shuffle=False, test_size=0.2)
+
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
+
+    latest_data = X_test.iloc[-1:]
+    entry_price = df['Close'].iloc[-1]
+    predicted_price = model.predict(latest_data)[0]
+    tp, sl = calculate_trade_levels(entry_price, predicted_price, RR_RATIO)
+
+    print(f"\n--- PREDICTION RESULTS FOR {TICKER} ---")
+    print(f"Entry Price: ${entry_price:.2f}")
+    print(f"Predicted Future Price: ${predicted_price:.2f}")
+    print(f"Take Profit: ${tp:.2f}")
+    print(f"Stop Loss: ${sl:.2f}")
+    print(f"Reward:Risk Ratio: {RR_RATIO}:1")
+
+if __name__ == "__main__":
+    run_model()
+# ---------------- STREAMLIT APP ----------------
+st.title("📈 Stock Price Predictor with TP/SL")
+
+with st.sidebar:
+    ticker = st.text_input("Stock Ticker", value="AAPL")
+    horizon = st.slider("Future Prediction Horizon (steps)", 1, 10, 3)
+    rr_ratio = st.slider("Reward to Risk Ratio", 1.0, 5.0, 2.0)
+    alpha_key = st.text_input("Alpha Vantage API Key", type="password")
+    lookback_days = st.slider("Lookback Period (days)", 30, 365, 180)
+    run = st.button("Run Prediction")
+
+if run and alpha_key:
+    with st.spinner("Loading and processing data..."):
+        try:
+            df = get_alpha_vantage_data, get_yfinance_data(ticker, interval="1h", lookback_days=lookback_days, alpha_key=alpha_key)
+            df = compute_features(df, horizon)
+
+            features = ['Open', 'High', 'Low', 'Close', 'Volume', 'MA20', 'MA50', 'Volatility']
+            X = df[features]
+            y = df['Target']
+            X_train, X_test, y_train, y_test = train_test_split(X, y, shuffle=False, test_size=0.2)
+
+            model = RandomForestRegressor(n_estimators=100, random_state=42)
+            model.fit(X_train, y_train)
+
+            latest_data = X_test.iloc[-1:]
+            entry_price = df['Close'].iloc[-1]
+            predicted_price = model.predict(latest_data)[0]
+            tp, sl = calculate_trade_levels(entry_price, predicted_price, rr_ratio)
+
+            st.subheader(f"Prediction Results for {ticker.upper()}")
+            st.metric("Entry Price", f"${entry_price:.2f}")
+            st.metric("Predicted Price", f"${predicted_price:.2f}")
+            st.metric("Take Profit (TP)", f"${tp:.2f}")
+            st.metric("Stop Loss (SL)", f"${sl:.2f}")
+
+            st.line_chart(df[['Close']].tail(100))
+
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+
+elif run and not alpha_key:
+    st.warning("Please enter your Alpha Vantage API key in the sidebar.")
+
